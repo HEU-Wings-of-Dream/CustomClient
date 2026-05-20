@@ -1,0 +1,173 @@
+自动部署工作流：
+  name: CI for Linux
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install system dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          build-essential cmake ninja-build pkg-config \
+          libgl1-mesa-dev libxkbcommon-x11-dev libxcb-randr0-dev \
+          libxcb-util-dev libxcb-keysyms1-dev libxcb-cursor-dev \
+          libxcb-xinerama0-dev libxcb-icccm4-dev libxcb-shape0-dev \
+          libxcb-xfixes0-dev libxcb-sync-dev libxcb-xkb-dev \
+          libxcb-dri3-dev libxcb-xinput-dev libx11-xcb-dev \
+          libxkbcommon-dev libxkbcommon-x11-dev libxrender-dev \
+          libxi-dev libxrandr-dev libxfixes-dev libxcursor-dev \
+          libxinerama-dev libwayland-dev libwayland-egl-backend-dev \
+          libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+          libswresample-dev libavfilter-dev libavdevice-dev \
+          libdbus-1-dev libatspi2.0-dev autoconf autoconf-archive \
+          automake libtool wget file
+
+    - name: Setup vcpkg
+      run: |
+        VCPKG_ROOT="${{ runner.workspace }}/vcpkg"
+        echo "VCPKG_ROOT=${VCPKG_ROOT}" >> $GITHUB_ENV
+        echo "${VCPKG_ROOT}" >> $GITHUB_PATH
+        git clone --depth 1 https://github.com/microsoft/vcpkg.git "${VCPKG_ROOT}"
+        "${VCPKG_ROOT}/bootstrap-vcpkg.sh"
+        vcpkg --version
+
+    - name: Create vcpkg.json
+      run: |
+        cat > vcpkg.json << 'EOF'
+        {
+          "name": "mqtt-application",
+          "version": "0.1.0",
+          "dependencies": [
+            "qtbase",
+            "qtmqtt",
+            "protobuf",
+            "abseil"
+          ]
+        }
+        EOF
+
+    - name: Cache vcpkg packages
+      uses: actions/cache@v4
+      id: cache-vcpkg
+      with:
+        path: |
+          ${{ runner.workspace }}/vcpkg/downloads
+          ${{ runner.workspace }}/vcpkg/installed
+          ${{ runner.workspace }}/vcpkg/buildtrees
+        key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json') }}
+        restore-keys: |
+          ${{ runner.os }}-vcpkg-
+
+    - name: Install dependencies via vcpkg
+      run: |
+        function retry {
+          local n=1 max=3 delay=10
+          while true; do
+            "$@" && break || {
+              if [[ $n -lt $max ]]; then ((n++)); echo "Retry $n/$max"; sleep $delay; else return 1; fi
+            }
+          done
+        }
+        retry vcpkg install --triplet x64-linux --recurse
+      env:
+        VCPKG_DEFAULT_TRIPLET: x64-linux
+
+    - name: Cache CMake build
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/build
+        key: ${{ runner.os }}-cmake-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}
+        restore-keys: |
+          ${{ runner.os }}-cmake-
+
+    - name: Configure CMake
+      run: |
+        cmake -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" \
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      env:
+        VCPKG_DEFAULT_TRIPLET: x64-linux
+
+    - name: Build
+      run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel $(nproc)
+
+    - name: Install linuxdeployqt
+      run: |
+        wget -c "https://github.com/probonopd/linuxdeployqt/releases/download/continuous/linuxdeployqt-continuous-x86_64.AppImage"
+        chmod a+x linuxdeployqt-continuous-x86_64.AppImage
+        ./linuxdeployqt-continuous-x86_64.AppImage --appimage-extract
+        sudo ln -s "$(pwd)/squashfs-root/AppRun" /usr/local/bin/linuxdeployqt
+
+    - name: Setup qmake PATH for linuxdeployqt
+      run: |
+        QMAKE_PATH="${{ runner.workspace }}/vcpkg/installed/x64-linux/tools/qt6/bin"
+        echo "${QMAKE_PATH}" >> $GITHUB_PATH
+
+    - name: Prepare desktop file for linuxdeployqt
+      run: |
+        mkdir -p AppDir
+        cat > AppDir/application.desktop << 'EOF'
+        [Desktop Entry]
+        Name=MQTT Application
+        Exec=Application
+        Icon=application
+        Type=Application
+        Categories=Utility;
+        EOF
+        touch AppDir/application.png
+
+    - name: Bundle with linuxdeployqt
+      run: |
+        mkdir -p AppDir/usr/bin
+        cp build/Application AppDir/usr/bin/
+        [ -f style.qss ] && cp style.qss AppDir/usr/bin/ || true
+
+        # 运行 linuxdeployqt 捆绑 Qt 依赖
+        linuxdeployqt AppDir/usr/bin/Application -bundle-non-qt-libs -always-overwrite
+
+        # 手动复制 FFmpeg 库（linuxdeployqt 不会自动处理）
+        mkdir -p AppDir/usr/lib
+        ldd build/Application | grep -E "libav(codec|format|util|swscale|swresample|filter|device)" | awk '{print $3}' | xargs -I {} cp -v {} AppDir/usr/lib/ || true
+
+        # 复制 Qt 平台插件（如果尚未被 linuxdeployqt 复制）
+        # linuxdeployqt 应该已经做了，但确保存在
+        if [ ! -d "AppDir/usr/bin/plugins" ]; then
+          cp -r "${{ runner.workspace }}/vcpkg/installed/x64-linux/bin/plugins" AppDir/usr/bin/ 2>/dev/null || true
+        fi
+
+    - name: Create run script
+      run: |
+        cat > AppDir/run.sh << 'EOF'
+        #!/bin/bash
+        DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+        export LD_LIBRARY_PATH="$DIR/usr/lib:$LD_LIBRARY_PATH"
+        export QT_PLUGIN_PATH="$DIR/usr/bin/plugins"
+        exec "$DIR/usr/bin/Application" "$@"
+        EOF
+        chmod +x AppDir/run.sh
+
+    - name: Package into tar.gz
+      run: tar -czf Application-linux-x86_64.tar.gz -C AppDir .
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Application-Linux
+        path: Application-linux-x86_64.tar.gz
