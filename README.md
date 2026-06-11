@@ -1,3 +1,6 @@
+2026/6/11后开发平台变更到Flutter 3.x + Dart 3.x,开发Android和Linux应用
+仓库地址:https://github.com/Zsdhak1/robomaster-custom-client
+
 自动部署工作流：
   name: CI for Linux
 
